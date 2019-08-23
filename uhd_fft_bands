@@ -1,0 +1,948 @@
+#!/usr/bin/python
+#
+# Copyright 2015-2016 Free Software Foundation, Inc.
+#
+# This file is part of GNU Radio
+#
+# GNU Radio is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 3, or (at your option)
+# any later version.
+#
+# GNU Radio is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with GNU Radio; see the file COPYING.  If not, write to
+# the Free Software Foundation, Inc., 51 Franklin Street,
+# Boston, MA 02110-1301, USA.
+#
+"""
+UHD FFT: Simple Spectrum Analyzer for UHD.
+"""
+
+# Original GRC header:
+##################################################
+# GNU Radio Python Flow Graph
+# Title: UHD FFT
+# Author: Example
+# Description: UHD FFT Waveform Plotter
+# Generated: Thu Jun 18 13:57:09 2015
+##################################################
+# Note this is a heavily modified version of a
+# the uhd_fft.grc example.
+
+import ctypes
+import sys
+import sip
+import threading
+import time
+import argparse
+from distutils.version import StrictVersion
+from PyQt5 import Qt, QtCore
+from gnuradio import eng_notation
+from gnuradio import eng_arg
+from gnuradio import gr
+from gnuradio import qtgui
+from gnuradio import uhd
+from gnuradio.filter import firdes
+from gnuradio.qtgui import Range, RangeWidget
+try:
+    from uhd_app_bands import UHDApp
+except ImportError:
+    from gnuradio.uhd.uhd_app_bands import UHDApp
+
+
+class uhd_fft(gr.top_block, Qt.QWidget, UHDApp):
+    """
+    Simple UHD Spectrum Analyzer / Scope App.
+    """
+    def __init__(self, args):
+        gr.top_block.__init__(self, "UHD FFT")
+        Qt.QWidget.__init__(self, args=args)
+        UHDApp.__init__(self, args=args, prefix="UHD FFT")
+        ##################################################
+        # Init QT App
+        ##################################################
+        self.setWindowTitle("UHD FFT")
+        try:
+            self.setWindowIcon(Qt.QIcon.fromTheme('gnuradio-grc'))
+        except:
+            pass
+        self.top_scroll_layout = Qt.QVBoxLayout()
+        self.setLayout(self.top_scroll_layout)
+        self.top_scroll = Qt.QScrollArea()
+        self.top_scroll.setFrameStyle(Qt.QFrame.NoFrame)
+        self.top_scroll_layout.addWidget(self.top_scroll)
+        self.top_scroll.setWidgetResizable(True)
+        self.top_widget = Qt.QWidget()
+        self.top_scroll.setWidget(self.top_widget)
+        self.top_layout = Qt.QVBoxLayout(self.top_widget)
+        self.top_grid_layout = Qt.QGridLayout()
+        self.top_layout.addLayout(self.top_grid_layout)
+        self.settings = Qt.QSettings("GNU Radio", "uhd_fft")
+        self.restoreGeometry(self.settings.value("geometry", type=QtCore.QByteArray))
+
+
+        ##################################################
+        # RAT to FREQ
+        ##################################################
+        self.RAT = args.RAT
+        self.channel = args.channel
+
+        if args.RAT:
+            if "gsm" in self.RAT:
+                args.freq = arfcn_calc(self.RAT,self.channel)
+            if "umts" in self.RAT:
+                args.freq = urfcn_calc(self.RAT,self.channel)
+                if args.samp_rate == 1000000.0:
+                    args.samp_rate = 10000000
+            if "lte" in self.RAT:
+                args.freq = earfcn_calc(self.RAT,self.channel)
+                if args.samp_rate == 1000000.0:
+                    args.samp_rate = 20000000
+
+        ##################################################
+        # Parameters
+        ##################################################
+        self.antenna = args.antenna
+        self.args = args
+        self.fft_size = args.fft_size
+        self.freq = args.freq
+        self.gain = args.gain
+        self.gain_type = args.gain_type
+        self.samp_rate = args.samp_rate
+        self.spec = args.spec
+        self.stream_args = args.stream_args
+        self.update_rate = args.update_rate
+        self.wire_format = args.otw_format
+
+        print "DL Frequency Set to ", self.freq / 1000000,"MHz"
+
+        ##################################################
+        # Variables
+        ##################################################
+        self.chan0_lo_locked = chan0_lo_locked = uhd.sensor_value("", False, "")
+        self.usrp_device_info = usrp_device_info = "[No USRP Device Info Found!]"
+        self.uhd_version_info = uhd_version_info = uhd.get_version_string()
+        self.lo_locked_probe = lo_locked_probe = chan0_lo_locked.to_bool()
+        self.fft_average = 1.0
+        if args.avg_alpha is not None:
+            if args.avg_alpha < 0.0 or args.avg_alpha > 1.0:
+                print("[UHD FFT] [ERROR] Alpha must be in [0.0, 1.0]!")
+                exit(1)
+            self.fft_average = args.avg_alpha
+        else:
+            fft_average_values = {
+                'off': 1.0,
+                'low': 0.2,
+                'medium': 0.1,
+                'high': 0.05
+            }
+            if args.fft_average in fft_average_values.keys():
+                self.fft_average = fft_average_values[args.fft_average]
+
+        ##################################################
+        # Blocks
+        ##################################################
+        self.setup_usrp(uhd.usrp_source, args)
+        self._ant_options = self.usrp.get_antennas(0)
+        for c in range(len(self.channels)):
+            self.usrp.set_bandwidth(self.samp_rate, c)
+        self.usrp_device_info = self.get_usrp_info_string(compact=True, tx_or_rx='rx')
+
+        ### Now set up the GUI widgets: #####################################
+        # Sampling rate:
+        self._samp_rate__tool_bar = Qt.QToolBar(self)
+        self._samp_rate__tool_bar.addWidget(Qt.QLabel("Sampling Rate: "))
+        self._samp_rate__line_edit = Qt.QLineEdit(eng_notation.num_to_str(self.samp_rate))
+        self._samp_rate__tool_bar.addWidget(self._samp_rate__line_edit)
+        self._samp_rate__line_edit.returnPressed.connect(
+            lambda: self.set_samp_rate(eng_notation.str_to_num(str(self._samp_rate__line_edit.text().toAscii()))))
+        self.top_grid_layout.addWidget(self._samp_rate__tool_bar, 3, 2, 1, 2)
+        # Gain:
+        self._gain__range = Range(
+            self.gain_range.start(),
+            self.gain_range.stop(),
+            max(self.gain_range.step(), 1.0),
+            self.gain,
+            200
+        )
+        self._gain__win = RangeWidget(self._gain__range, self.set_gain, "RX Gain", "counter_slider", float)
+        self.top_grid_layout.addWidget(self._gain__win, 2,0,1,4)
+        # Center frequency:
+        self._freq_tool_bar = Qt.QToolBar(self)
+        self._freq_tool_bar.addWidget(Qt.QLabel("RX Tune Frequency: "))
+        self._freq_line_edit = Qt.QLineEdit(eng_notation.num_to_str(self.freq))
+        self._freq_tool_bar.addWidget(self._freq_line_edit)
+        self._freq_line_edit.returnPressed.connect(
+            lambda: self.set_freq_qt(eng_notation.str_to_num(str(self._freq_line_edit.text().toAscii()))))
+        self.top_grid_layout.addWidget(self._freq_tool_bar, 3,0,1,2)
+        # Antenna Selection:
+        self._ant_labels = self._ant_options
+        self._ant_tool_bar = Qt.QToolBar(self)
+        self._ant_tool_bar.addWidget(Qt.QLabel("Antenna: "))
+        self._ant_combo_box = Qt.QComboBox()
+        self._ant_tool_bar.addWidget(self._ant_combo_box)
+        for label in self._ant_labels: self._ant_combo_box.addItem(label)
+        self._ant_callback = lambda i: Qt.QMetaObject.invokeMethod(self._ant_combo_box, "setCurrentIndex", Qt.Q_ARG("int", self._ant_options.index(i)))
+        self._ant_callback(self.antenna)
+        self._ant_combo_box.currentIndexChanged.connect(lambda i: self.set_ant(self._ant_options[i]))
+        self.top_grid_layout.addWidget(self._ant_tool_bar, 4,2,1,2)
+        # Device + UHD info:
+        self._usrp_device_info_tool_bar = Qt.QToolBar(self)
+        self._usrp_device_info_formatter = lambda x: x
+        self._usrp_device_info_tool_bar.addWidget(Qt.QLabel("Device Information: "))
+        self._usrp_device_info_label = Qt.QLabel(str(self._usrp_device_info_formatter(self.usrp_device_info)))
+        self._usrp_device_info_tool_bar.addWidget(self._usrp_device_info_label)
+        self.top_grid_layout.addWidget(self._usrp_device_info_tool_bar, 1,2,1,2)
+        self._uhd_version_info_tool_bar = Qt.QToolBar(self)
+        self._uhd_version_info_formatter = lambda x: x
+        self._uhd_version_info_tool_bar.addWidget(Qt.QLabel("UHD Version: "))
+        self._uhd_version_info_label = Qt.QLabel(str(self._uhd_version_info_formatter(self.uhd_version_info)))
+        self._uhd_version_info_tool_bar.addWidget(self._uhd_version_info_label)
+        self.top_grid_layout.addWidget(self._uhd_version_info_tool_bar, 1,0,1,2)
+        ### Plot GUIs #######################################################
+        widths = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+        colors = ["blue", "red", "green", "cyan", "magenta", "black", "yellow", "dark red", "dark green", "dark blue"]
+        styles = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+        markers = [-1, -1, -1, -1, -1, -1, -1, -1, -1, -1]
+        alphas = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+        self.display = Qt.QTabWidget()
+        self.display_widget_0 = Qt.QWidget()
+        self.display_layout_0 = Qt.QBoxLayout(Qt.QBoxLayout.TopToBottom, self.display_widget_0)
+        self.display_grid_layout_0 = Qt.QGridLayout()
+        self.display_layout_0.addLayout(self.display_grid_layout_0)
+        self.display.addTab(self.display_widget_0, "Spectrum")
+        self.display_widget_1 = Qt.QWidget()
+        self.display_layout_1 = Qt.QBoxLayout(Qt.QBoxLayout.TopToBottom, self.display_widget_1)
+        self.display_grid_layout_1 = Qt.QGridLayout()
+        self.display_layout_1.addLayout(self.display_grid_layout_1)
+        self.display.addTab(self.display_widget_1, "Waterfall")
+        self.display_widget_2 = Qt.QWidget()
+        self.display_layout_2 = Qt.QBoxLayout(Qt.QBoxLayout.TopToBottom, self.display_widget_2)
+        self.display_grid_layout_2 = Qt.QGridLayout()
+        self.display_layout_2.addLayout(self.display_grid_layout_2)
+        self.display.addTab(self.display_widget_2, "Scope")
+        self.top_grid_layout.addWidget(self.display, 0,0,1,4)
+        self.qtgui_waterfall_sink_x_0 = qtgui.waterfall_sink_c(
+            self.fft_size, #size
+            firdes.WIN_BLACKMAN_hARRIS, #wintype
+            self.freq, #fc
+            self.samp_rate, #bw
+            "", #name
+            len(self.channels) #number of inputs
+        )
+        self.qtgui_waterfall_sink_x_0.set_update_time(self.update_rate)
+        self.qtgui_waterfall_sink_x_0.enable_grid(False)
+        self.qtgui_waterfall_sink_x_0.disable_legend()
+        alpha = 10.**(len(self.channels)-1)
+        for i in xrange(len(self.channels)):
+            self.qtgui_waterfall_sink_x_0.set_line_label(i, "Channel {0}".format(i))
+            self.qtgui_waterfall_sink_x_0.set_color_map(i, 0)
+            self.qtgui_waterfall_sink_x_0.set_line_alpha(i, alpha)
+        self.qtgui_waterfall_sink_x_0.set_intensity_range(-90, 10)
+        self._qtgui_waterfall_sink_x_0_win = sip.wrapinstance(self.qtgui_waterfall_sink_x_0.pyqwidget(), Qt.QWidget)
+        self.display_grid_layout_1.addWidget(self._qtgui_waterfall_sink_x_0_win, 0,0,1,4)
+        self.qtgui_time_sink_x_0 = qtgui.time_sink_c(
+                1024, #size
+                self.samp_rate, #samp_rate
+                "", #name
+                len(self.channels) #number of inputs
+        )
+        self.qtgui_time_sink_x_0.set_update_time(self.update_rate)
+        self.qtgui_time_sink_x_0.set_y_axis(-1, 1)
+        self.qtgui_time_sink_x_0.set_y_label("Amplitude", "")
+        self.qtgui_time_sink_x_0.enable_tags(-1, True)
+        self.qtgui_time_sink_x_0.set_trigger_mode(qtgui.TRIG_MODE_FREE, qtgui.TRIG_SLOPE_POS, 0.0, 0, 0, "")
+        self.qtgui_time_sink_x_0.enable_autoscale(True)
+        self.qtgui_time_sink_x_0.enable_grid(False)
+        self.qtgui_time_sink_x_0.enable_control_panel(True)
+        self.qtgui_time_sink_x_0.disable_legend()
+        for i in xrange(2*len(self.channels)):
+            if(i % 2 == 0):
+                self.qtgui_time_sink_x_0.set_line_label(i, "Re{{Channel {0}}}".format(i/2))
+            else:
+                self.qtgui_time_sink_x_0.set_line_label(i, "Im{{Channel {0}}}".format(i/2))
+            self.qtgui_time_sink_x_0.set_line_width(i, widths[i])
+            self.qtgui_time_sink_x_0.set_line_color(i, colors[i])
+            self.qtgui_time_sink_x_0.set_line_style(i, styles[i])
+            self.qtgui_time_sink_x_0.set_line_marker(i, markers[i])
+            self.qtgui_time_sink_x_0.set_line_alpha(i, alphas[i])
+        self._qtgui_time_sink_x_0_win = sip.wrapinstance(self.qtgui_time_sink_x_0.pyqwidget(), Qt.QWidget)
+        self.display_grid_layout_2.addWidget(self._qtgui_time_sink_x_0_win, 0,0,1,4)
+        self.qtgui_freq_sink_x_0 = qtgui.freq_sink_c(
+                self.fft_size, #size
+                firdes.WIN_BLACKMAN_hARRIS, #wintype
+                self.freq, #fc
+                self.samp_rate, #bw
+                "", #name
+                len(self.channels) #number of inputs
+        )
+        self.qtgui_freq_sink_x_0.set_update_time(self.update_rate)
+        self.qtgui_freq_sink_x_0.set_y_axis(-100, 10)
+        self.qtgui_freq_sink_x_0.set_trigger_mode(qtgui.TRIG_MODE_FREE, 0.0, 0, "")
+        self.qtgui_freq_sink_x_0.enable_autoscale(True)
+        self.qtgui_freq_sink_x_0.enable_grid(True)
+        self.qtgui_freq_sink_x_0.set_fft_average(self.fft_average)
+        self.qtgui_freq_sink_x_0.enable_control_panel(True)
+        self.qtgui_freq_sink_x_0.disable_legend()
+        for i in xrange(len(self.channels)):
+            self.qtgui_freq_sink_x_0.set_line_label(i, "Channel {0}".format(i))
+            self.qtgui_freq_sink_x_0.set_line_width(i, widths[i])
+            self.qtgui_freq_sink_x_0.set_line_color(i, colors[i])
+            self.qtgui_freq_sink_x_0.set_line_alpha(i, alphas[i])
+        self._qtgui_freq_sink_x_0_win = sip.wrapinstance(self.qtgui_freq_sink_x_0.pyqwidget(), Qt.QWidget)
+        self.display_grid_layout_0.addWidget(self._qtgui_freq_sink_x_0_win, 0,0,1,4)
+        def _freeze_scaling(widget, sleep_time):
+            time.sleep(sleep_time)
+            widget.enable_autoscale(False)
+        _freeze_fft_thread = threading.Thread(target=lambda: _freeze_scaling(self.qtgui_freq_sink_x_0, .5/self.fft_average))
+        _freeze_fft_thread.daemon = True
+        _freeze_fft_thread.start()
+        _freeze_scope_thread = threading.Thread(target=lambda: _freeze_scaling(self.qtgui_time_sink_x_0, 2.0))
+        _freeze_scope_thread.daemon = True
+        _freeze_scope_thread.start()
+        if args.phase_relations and len(self.channels) > 1:
+            self.display_widget_phase = Qt.QWidget()
+            self.display_layout_phase = Qt.QBoxLayout(Qt.QBoxLayout.TopToBottom, self.display_widget_phase)
+            self.display_grid_layout_phase = Qt.QGridLayout()
+            self.display_layout_phase.addLayout(self.display_grid_layout_phase)
+            self.display.addTab(self.display_widget_phase, "Rel. Phase")
+            self.qtgui_phase_plot = qtgui.time_sink_f(
+                    1024, #size
+                    self.samp_rate, #samp_rate
+                    "", #name
+                    len(self.channels) - 1
+            )
+            self.qtgui_phase_plot.set_update_time(self.update_rate)
+            self.qtgui_phase_plot.set_y_axis(-3.5, 3.5)
+            self.qtgui_phase_plot.set_y_label("Relative Phase", "")
+            self.qtgui_phase_plot.enable_tags(-1, True)
+            self.qtgui_phase_plot.set_trigger_mode(qtgui.TRIG_MODE_FREE, qtgui.TRIG_SLOPE_POS, 0.0, 0, 0, "")
+            self.qtgui_phase_plot.enable_autoscale(False)
+            self.qtgui_phase_plot.enable_grid(True)
+            self.qtgui_phase_plot.enable_control_panel(True)
+            self.qtgui_phase_plot.disable_legend()
+            for i in xrange(len(self.channels) - 1):
+                self.qtgui_phase_plot.set_line_label(i, "Phase Delta Channels {0}/{1}".format(i, i+1))
+                self.qtgui_phase_plot.set_line_width(i, widths[i])
+                self.qtgui_phase_plot.set_line_color(i, colors[i])
+                self.qtgui_phase_plot.set_line_style(i, styles[i])
+                self.qtgui_phase_plot.set_line_marker(i, markers[i])
+                self.qtgui_phase_plot.set_line_alpha(i, alphas[i])
+            self._qtgui_phase_plot_win = sip.wrapinstance(self.qtgui_phase_plot.pyqwidget(), Qt.QWidget)
+            self.display_grid_layout_phase.addWidget(self._qtgui_phase_plot_win, 0,0,1,4)
+        ### Other widgets ###################################################
+        self._lo_locked_probe_tool_bar = Qt.QToolBar(self)
+        self._lo_locked_probe_formatter = lambda x: {True: 'Yes', False: 'No'}[x]
+        if self.has_lo_sensor:
+            self._lo_locked_probe_tool_bar.addWidget(Qt.QLabel("LO locked: "))
+            self._lo_locked_probe_label = Qt.QLabel(str(self._lo_locked_probe_formatter(self.lo_locked_probe)))
+        else:
+            self._lo_locked_probe_tool_bar.addWidget(Qt.QLabel("No LO lock sensor available."))
+            self._lo_locked_probe_label = Qt.QLabel("")
+        self._lo_locked_probe_tool_bar.addWidget(self._lo_locked_probe_label)
+        self.top_grid_layout.addWidget(self._lo_locked_probe_tool_bar, 4,0,1,2)
+        def _current_freq_probe():
+            while True:
+                val = self.usrp.get_center_freq(0)
+                try:
+                    if val != self.freq:
+                        self.set_freq_qt(val, tune_source='freqsink_msg')
+                except AttributeError:
+                    pass
+                time.sleep(1.0 / (10))
+        _current_freq_thread = threading.Thread(target=_current_freq_probe)
+        _current_freq_thread.daemon = True
+        _current_freq_thread.start()
+        def _chan0_lo_locked_probe():
+            while self.has_lo_sensor:
+                val = self.usrp.get_sensor('lo_locked')
+                try:
+                    self.set_chan0_lo_locked(val)
+                except AttributeError:
+                    pass
+                time.sleep(1.0 / (10))
+        _chan0_lo_locked_thread = threading.Thread(target=_chan0_lo_locked_probe)
+        _chan0_lo_locked_thread.daemon = True
+        _chan0_lo_locked_thread.start()
+
+        ##################################################
+        # Connections
+        ##################################################
+        self.msg_connect((self.qtgui_freq_sink_x_0, 'freq'), (self.qtgui_freq_sink_x_0, 'freq'))
+        self.msg_connect((self.qtgui_freq_sink_x_0, 'freq'), (self.usrp, 'command'))
+        for idx in range(len(self.channels)):
+            self.connect((self.usrp, idx), (self.qtgui_freq_sink_x_0, idx))
+            self.connect((self.usrp, idx), (self.qtgui_time_sink_x_0, idx))
+            self.connect((self.usrp, idx), (self.qtgui_waterfall_sink_x_0, idx))
+        if args.phase_relations and len(self.channels) > 1:
+            for idx in range(len(self.channels[:-1])):
+                self.connect_phase_plot(
+                        (self.usrp, idx),
+                        (self.usrp, idx+1),
+                        (self.qtgui_phase_plot, idx)
+                )
+
+    def connect_phase_plot(self, src_port1, src_port2, dst_port):
+        " Calculate relative phase between two src ports and send it dst_port "
+        from gnuradio import blocks
+        multiplier = blocks.multiply_cc()
+        self.connect(src_port1, (multiplier, 0), blocks.complex_to_arg(), dst_port)
+        self.connect(src_port2, blocks.conjugate_cc(), (multiplier, 1))
+
+    def closeEvent(self, event):
+        self.settings = Qt.QSettings("GNU Radio", "uhd_fft")
+        self.settings.setValue("geometry", self.saveGeometry())
+        event.accept()
+
+    def set_antenna(self, antenna):
+        self.antenna = antenna
+        self.set_ant(self.antenna)
+
+    def set_args(self, args):
+        self.args = args
+
+    def set_fft_size(self, fft_size):
+        self.fft_size = fft_size
+
+    def set_freq_qt(self, freq, tune_source='textbox'):
+        if freq == self.freq:
+            return
+        if tune_source == 'textbox':
+            # This sets self.freq:
+            self.set_freq(freq, skip_sync=False)
+        elif tune_source == 'freqsink_msg':
+            self.freq = freq
+        else:
+            raise RuntimeError("Invalid tune source: {src}".format(tune_source))
+        Qt.QMetaObject.invokeMethod(
+                self._freq_line_edit, "setText",
+                Qt.Q_ARG("QString", eng_notation.num_to_str(self.freq))
+        )
+        self.qtgui_waterfall_sink_x_0.set_frequency_range(self.freq, self.samp_rate)
+        if tune_source != 'freqsink_msg':
+            self.qtgui_freq_sink_x_0.set_frequency_range(self.freq, self.samp_rate)
+
+    def set_update_rate(self, update_rate):
+        self.update_rate = update_rate
+        self.qtgui_freq_sink_x_0.set_update_time(self.update_rate)
+        self.qtgui_time_sink_x_0.set_update_time(self.update_rate)
+        self.qtgui_waterfall_sink_x_0.set_update_time(self.update_rate)
+
+    def set_chan0_lo_locked(self, chan0_lo_locked):
+        if not self.has_lo_sensor:
+            return
+        self.chan0_lo_locked = chan0_lo_locked
+        self.set_lo_locked_probe(self._lo_locked_probe_formatter(self.chan0_lo_locked.to_bool()))
+
+    def set_usrp_device_info(self, usrp_device_info):
+        self.usrp_device_info = usrp_device_info
+        Qt.QMetaObject.invokeMethod(self._usrp_device_info_label, "setText", Qt.Q_ARG("QString", repr(self.usrp_device_info)))
+
+    def set_uhd_version_info(self, uhd_version_info):
+        self.uhd_version_info = uhd_version_info
+        Qt.QMetaObject.invokeMethod(self._uhd_version_info_label, "setText", Qt.Q_ARG("QString", str(self.uhd_version_info)))
+
+    def set_samp_rate(self, samp_rate):
+        self.vprint("Setting sampling rate to: {} MHz".format(samp_rate / 1e6))
+        self.samp_rate = samp_rate
+        Qt.QMetaObject.invokeMethod(
+                self._samp_rate__line_edit, "setText",
+                Qt.Q_ARG("QString", eng_notation.num_to_str(self.samp_rate))
+        )
+        self.qtgui_freq_sink_x_0.set_frequency_range(self.freq, self.samp_rate)
+        self.qtgui_time_sink_x_0.set_samp_rate(self.samp_rate)
+        self.qtgui_waterfall_sink_x_0.set_frequency_range(self.freq, self.samp_rate)
+        self.usrp.set_samp_rate(self.samp_rate)
+        for c in range(len(self.channels)):
+            self.usrp.set_bandwidth(self.samp_rate, c)
+
+    def set_lo_locked_probe(self, lo_locked_probe):
+        self.lo_locked_probe = lo_locked_probe
+        Qt.QMetaObject.invokeMethod(self._lo_locked_probe_label, "setText", Qt.Q_ARG("QString", str(self.lo_locked_probe)))
+
+    def set_ant(self, ant):
+        self.antenna = ant
+        self._ant_callback(self.antenna)
+        for c in range(len(self.channels)):
+            self.usrp.set_antenna(self.antenna, c)
+
+
+def setup_argparser():
+    """
+    Create argument parser for UHD FFT.
+    """
+    parser = UHDApp.setup_argparser(
+            description="UHD FFT",
+            tx_or_rx="Rx",
+    )
+    group = parser.add_argument_group('UHD FFT Arguments')
+    group.add_argument("--fft-size", type=eng_arg.intx, default=1024,
+        help="Set number of FFT bins")
+    group.add_argument("--fft-average", default='medium', choices=('off', 'low', 'medium', 'high'),
+        help="Set FFT averaging")
+    group.add_argument("--avg-alpha", type=float, default=None,
+        help="Specify FFT average alpha (overrides --fft-average)")
+    group.add_argument("--update-rate", dest="update_rate", type=eng_arg.eng_float, default=eng_notation.num_to_str(.1),
+        help="Set GUI widget update rate")
+    group.add_argument("--phase-relations", action="store_true",
+        help="Plot relative phases between multiple channels")
+
+    group2 = parser.add_argument_group('Additional Arguments')
+    group2.add_argument("-ch" , dest="channel", type=float, default =None,
+        help="set the channel number for the given RAT BAND selected.")
+    group2.add_argument("-r" , dest="RAT",
+        choices=(
+        'gsm-450',
+        'gsm-480',
+        'gsm-750',
+        'gsm-850',
+        'gsm-900',
+        'gsm-1800',
+        'gsm-1900',
+        'umts-1', 'umts-2100',
+        'umts-2',
+        'umts-3',
+        'umts-4',
+        'umts-5', 'umts-850',
+        'umts-6',
+        'umts-7',
+        'umts-8', 'umts-900'
+        'umts-9',
+        'lte-1',
+        'lte-2',
+        'lte-3',
+        'lte-4',
+        'lte-5',
+        'lte-6',
+        'lte-7',
+        'lte-8',
+        'lte-9',
+        'lte-10',
+        'lte-11',
+        'lte-12',
+        'lte-13',
+        'lte-14',
+        'lte-17',
+        'lte-18',
+        'lte-19',
+        'lte-20',
+        'lte-21',
+        'lte-22',
+        'lte-23',
+        'lte-24',
+        'lte-25',
+        'lte-26',
+        'lte-27',
+        'lte-28',
+        'lte-29',
+        'lte-31',
+        'lte-33',
+        'lte-34',
+        'lte-35',
+        'lte-36',
+        'lte-37',
+        'lte-38',
+        'lte-39',
+        'lte-40',
+        'lte-41',
+        'lte-42',
+        'lte-43',
+        'lte-44',
+        'cdma'),
+        help="Set RAT 'gsm-band', 'umts-x', 'lte-x', or 'cdma'")
+
+
+    return parser
+
+def arfcn_calc(band, channel):
+    """
+    Channel Band Calculations for GSM.
+    """
+    ch_low    = 0
+    ch_high   = 0
+    start_freq= 0
+    N_off     = 0
+    dl_offset = 0
+    # print band, channel
+    if band == 'gsm-450':
+        ch_low    = 259
+        ch_high   = 293
+        start_freq= 450.6
+        N_off     = 259
+        dl_offset = 10
+    if band == "gsm-480":
+        ch_low    = 306
+        ch_high   = 340
+        start_freq= 479
+        N_off     = 306
+        dl_offset = 10
+    if band == "gsm-750":
+        ch_low    = 438
+        ch_high   = 511
+        start_freq= 747.2
+        N_off     = 438
+        dl_offset = 30
+    if band == "gsm-850":
+        ch_low    = 128
+        ch_high   = 251
+        start_freq= 824.2
+        N_off     = 128
+        dl_offset = 45
+    if band == "gsm-900" and channel >= 1 and channel <=124:
+        ch_low    = 1
+        ch_high   = 124
+        start_freq= 890
+        N_off     = 0
+        dl_offset = 45
+    if band == "gsm-900" and channel >= 975 and channel <=1023:
+        ch_low    = 975
+        ch_high   = 1023
+        start_freq= 890
+        N_off     = 1024
+        dl_offset = 45
+    if band == "gsm-1800":
+        ch_low    = 512
+        ch_high   = 885
+        start_freq= 1710.2
+        N_off     = 512
+        dl_offset = 95
+    if band == "gsm-1900":
+        ch_low    = 512
+        ch_high   = 810
+        start_freq= 1850.2
+        N_off     = 512
+        dl_offset = 80
+
+    if channel >= ch_low and channel <= ch_high:
+        return (start_freq +0.2*(channel - N_off) + dl_offset)*1000000
+    else:
+        print band, "Channel Number not in range" , ch_low, "-" , ch_high
+        exit(1)
+    # if self.RAT == 'gsm-450':
+    #     if args.channel >= 259 and args.channel <= 293:
+    #         args.freq = 450.6 + 0.2*(args.channel - 259) + 10
+    #     else:
+    #         print self.RAT , "Channel Number not in range 259-293"
+    #         exit(1)
+
+def urfcn_calc(band, channel):
+    """
+    Channel Band Calculations for UMTS.
+    """
+    umts_offset = 0
+    ch_low      = 0
+    ch_high     = 0
+
+
+    if band == "umts-1" or band == "umts-2100":
+        umts_offset = 0
+        ch_low      = 10562
+        ch_high     = 10838
+    if band == "umts-2":
+        umts_offset = 0
+        ch_low      = 9662
+        ch_high     = 9938
+    if band == "umts-3":
+        umts_offset = 1575
+        ch_low      = 1162
+        ch_high     = 1513
+    if band == "umts-4":
+        umts_offset = 1805
+        ch_low      = 1537
+        ch_high     = 1738
+    if band == "umts-5" or band == "umts-850":
+        umts_offset = 0
+        ch_low      = 4357
+        ch_high     = 4458
+    if band == "umts-6":
+        umts_offset = 0
+        ch_low      = 4387
+        ch_high     = 4413
+    if band == "umts-7":
+        umts_offset = 2175
+        ch_low      = 2237
+        ch_high     = 2563
+    if band == "umts-8" or band == "umts-900":
+        umts_offset = 340
+        ch_low      = 2937
+        ch_high     = 3088
+    if band == "umts-9":
+        umts_offset = 0
+        ch_low      = 9237
+        ch_high     = 9387
+
+        # UMTS Band Support List
+        # 'umts-1', 'umts-2100',
+        # 'umts-2',
+        # 'umts-3',
+        # 'umts-4',
+        # 'umts-5', 'umts-850',
+        # 'umts-6',
+        # 'umts-7',
+        # 'umts-8', 'umts-900'
+        # 'umts-9'
+
+    if channel >= ch_low and channel <= ch_high:
+        return .2*(channel - umts_offset)*1000000
+    else:
+        print band , "Channel Number not in range", ch_low, "-" , ch_high
+        exit(1)
+
+def earfcn_calc(band, channel):
+    """
+    Channel Band Calculations for LTE.
+    """
+    FDL_low     = 0
+    NOffs       = 0
+    ch_low      = 0
+    ch_high     = 0
+
+    # print band, channel
+    if band ==  "lte-1":
+    	FDL_low=2110
+        NOffs=0
+        ch_low=0
+        ch_high=599
+    if band ==  "lte-2":
+    	FDL_low=1930
+        NOffs=600
+        ch_low=60
+        ch_high=1199
+    if band ==  "lte-3":
+    	FDL_low=1805
+        NOffs=1200
+        ch_low=120
+        ch_high=1949
+    if band ==  "lte-4":
+    	FDL_low=2110
+        NOffs=1950
+        ch_low=195
+        ch_high=2399
+    if band ==  "lte-5":
+    	FDL_low=869
+        NOffs=2400
+        ch_low=240
+        ch_high=2649
+    if band ==  "lte-6":
+        FDL_low=875
+        NOffs=2650
+        ch_low=265
+        ch_high=2749
+    if band ==  "lte-7":
+        FDL_low=2620
+        NOffs=2750
+        ch_low=275
+        ch_high=3449
+    if band ==  "lte-8":
+    	FDL_low=925
+        NOffs=3450
+        ch_low=345
+        ch_high=3799
+    if band ==  "lte-9":
+        FDL_low=1844.9
+        NOffs=3800
+        ch_low=380
+        ch_high=4149
+    if band ==  "lte-10":
+    	FDL_low=2110
+        NOffs=4150
+        ch_low=415
+        ch_high=4749
+    if band ==  "lte-11":
+    	FDL_low=1475.9
+        NOffs=4750
+        ch_low=475
+        ch_high=4949
+    if band ==  "lte-12":
+    	FDL_low=729
+        NOffs=5010
+        ch_low=501
+        ch_high=5179
+    if band ==  "lte-13":
+    	FDL_low=746
+        NOffs=5180
+        ch_low=518
+        ch_high=5279
+    if band ==  "lte-14":
+    	FDL_low=758
+        NOffs=5280
+        ch_low=528
+        ch_high=5379
+    if band ==  "lte-17":
+    	FDL_low=734
+        NOffs=5730
+        ch_low=573
+        ch_high=5849
+    if band ==  "lte-18":
+    	FDL_low=860
+        NOffs=5850
+        ch_low=585
+        ch_high=5999
+    if band ==  "lte-19":
+    	FDL_low=875
+        NOffs=6000
+        ch_low=600
+        ch_high=6149
+    if band ==  "lte-20":
+        FDL_low=791
+        NOffs=6150
+        ch_low=615
+        ch_high=6449
+    if band ==  "lte-21":
+    	FDL_low=1495.9
+        NOffs=6450
+        ch_low=645
+        ch_high=6599
+    if band ==  "lte-22":
+    	FDL_low=3510
+        NOffs=6600
+        ch_low=660
+        ch_high=7399
+    if band ==  "lte-23":
+        FDL_low=2180
+        NOffs=7500
+        ch_low=750
+        ch_high=7699
+    if band ==  "lte-24":
+        FDL_low=1525
+        NOffs=7700
+        ch_low=770
+        ch_high=8039
+    if band ==  "lte-25":
+        FDL_low=1930
+        NOffs=8040
+        ch_low=804
+        ch_high=8689
+    if band ==  "lte-26":
+        FDL_low=859
+        NOffs=8690
+        ch_low=869
+        ch_high=9039
+    if band ==  "lte-27":
+        FDL_low=852
+        NOffs=9040
+        ch_low=904
+        ch_high=9209
+    if band ==  "lte-28":
+        FDL_low=758
+        NOffs=9210
+        ch_low=921
+        ch_high=9659
+    if band ==  "lte-29":
+        FDL_low=717
+        NOffs=9660
+        ch_low=966
+        ch_high=9769
+    if band ==  "lte-31":
+        FDL_low=462.5
+        NOffs=9870
+        ch_low=987
+        ch_high=9919
+    if band ==  "lte-33":
+        FDL_low=1900
+        NOffs=36000
+        ch_low=3600
+        ch_high=36199
+    if band ==  "lte-34":
+        FDL_low=2010
+        NOffs=36200
+        ch_low=3620
+        ch_high=36349
+    if band ==  "lte-35":
+        FDL_low=1850
+        NOffs=36350
+        ch_low=3635
+        ch_high=36949
+    if band ==  "lte-36":
+        FDL_low=1930
+        NOffs=36950
+        ch_low=3695
+        ch_high=37549
+    if band ==  "lte-37":
+        FDL_low=1910
+        NOffs=37550
+        ch_low=3755
+        ch_high=37749
+    if band ==  "lte-38":
+        FDL_low=2570
+        NOffs=37750
+        ch_low=3775
+        ch_high=38249
+    if band ==  "lte-39":
+        FDL_low=1880
+        NOffs=38250
+        ch_low=3825
+        ch_high=38649
+    if band ==  "lte-40":
+        FDL_low=2300
+        NOffs=38650
+        ch_low=3865
+        ch_high=39649
+    if band ==  "lte-41":
+        FDL_low=2496
+        NOffs=39650
+        ch_low=3965
+        ch_high=41589
+    if band ==  "lte-42":
+        FDL_low=3400
+        NOffs=41590
+        ch_low=4159
+        ch_high=43589
+    if band ==  "lte-43":
+        FDL_low=3600
+        NOffs=43590
+        ch_low=4359
+        ch_high=45589
+    if band ==  "lte-44":
+        FDL_low=703
+        NOffs=45590
+        ch_low=4559
+        ch_high=46589
+
+
+    if channel >= NOffs and channel <= ch_high:
+        return FDL_low + 0.1*(channel - NOffs)*1000000
+    else:
+        print band , "Channel Number not in range", NOffs, "-" , ch_high
+        exit(1)
+
+
+def main():
+    """
+    Go, go, go!
+    """
+    args = setup_argparser().parse_args()
+
+    if not args.channel and args.RAT:
+        argparse.ArgumentParser().error('-r (RAT) and -ch (Channel) MUST be used together. If not use -f (frequency)')
+
+    if args.freq and (args.RAT or args.channel):
+        argparse.ArgumentParser().error('You cannot use -r (RAT) or -ch (channel) AND -f (frequency) together. Please choose one or the other.')
+
+
+    #if StrictVersion(Qt.qVersion()) >= StrictVersion("4.5.0"):
+    #    Qt.QApplication.setGraphicsSystem(gr.prefs().get_string('qtgui','style','raster'))
+    qapp = Qt.QApplication(sys.argv)
+    tb = uhd_fft(args)
+    tb.start()
+    tb.show()
+    def quitting():
+        tb.stop()
+        tb.wait()
+    qapp.aboutToQuit.connect(quitting)
+    qapp.exec_()
+    tb = None #to clean up Qt widgets
+
+if __name__ == '__main__':
+    if sys.platform.startswith('linux'):
+        try:
+            x11 = ctypes.cdll.LoadLibrary('libX11.so')
+            x11.XInitThreads()
+        except:
+            print("Warning: failed to XInitThreads()")
+    main()
